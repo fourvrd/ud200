@@ -178,7 +178,6 @@ class UlanziD200Device(DeckDevice):
         chunk_size = 1024
 
         data = b''
-        # with open('bk/12345678-bug.zip', 'rb') as fp:
         with open(os.path.join('.build', 'build.zip'), 'rb') as fp:
             data += fp.read()
 
@@ -250,15 +249,23 @@ class UlanziD200Device(DeckDevice):
                     button_data['ViewParam'][0]['Text'] = button['name']
 
                 if 'icon' in button:
-                    # Copy icon - support both filename (for cache) and full path
+                    # improved icon path handling - checks multiple locations
                     icon_source = button['icon']
                     icon_name = os.path.basename(icon_source)
 
-                    if os.path.exists(icon_source):
-                        shutil.copyfile(icon_source, os.path.join(
-                            '.build', 'page', 'icons', icon_name))
-                    else:
-                        # Fallback to cache for backward compatibility
+                    found = False
+                    # try direct path, then icons/ folder
+                    search_paths = [icon_source,
+                                    os.path.join('icons', icon_name)]
+                    for p in search_paths:
+                        if os.path.exists(p):
+                            shutil.copyfile(p, os.path.join(
+                                '.build', 'page', 'icons', icon_name))
+                            found = True
+                            break
+
+                    if not found:
+                        # fallback to original cache
                         cache_path = os.path.join(
                             '.cache', 'icons', '_generated', icon_source)
                         if os.path.exists(cache_path):
@@ -274,30 +281,20 @@ class UlanziD200Device(DeckDevice):
             json.dump(manifest, fp, sort_keys=True,
                       separators=(',', ':'), indent=2)
 
-        # Chunks start with these bytes cause problems
-        invalid_bytes = [
-            b'\x00',
-            # b'\x01',
-            b'\x7c',
-        ]
-
+        invalid_bytes = [b'\x00', b'\x7c']
         dummy_str = ''
         dummy_retries = 0
         dummy_path = os.path.join(page_path, 'dummy.txt')
 
         while True:
-            # Write a dummy file with random string to modify the zip
             if dummy_retries > 0:
                 with open(dummy_path, 'w') as fp:
                     dummy_str += random_string(8 * dummy_retries)
                     fp.write(dummy_str)
 
-            # Create ZIP file
             compress_folder(page_path, '.build.zip', 1)
             file_size = os.path.getsize('.build.zip')
 
-            # There is a bug with the deck when byte value at 1016, 1016 + 1024... is one of invalid_bytes
-            # Check to avoid that
             valid = True
             with open('.build.zip', 'rb') as fp:
                 for i in range(1016, file_size, 1024):
@@ -306,10 +303,8 @@ class UlanziD200Device(DeckDevice):
                     if byte_at in invalid_bytes:
                         valid = False
                         break
-
             if valid:
                 break
-
             dummy_retries += 1
             time.sleep(0.05)
 
