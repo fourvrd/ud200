@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import binascii
 import json
 import os
-import shutil
 import time
+import io
+import zipfile
 from datetime import datetime
 from enum import Enum
 from typing import Dict
@@ -18,7 +18,6 @@ from construct import (
     Const,
     CString,
     Computed,
-    ExprAdapter,
     GreedyBytes,
     Int32ub,
     Padded,
@@ -27,10 +26,11 @@ from construct import (
     this,
 )
 from deepdiff import DeepDiff
+from PIL import Image
 from dotenv import load_dotenv
 
 from ..device import ButtonAction, DeckDevice
-from ..utils import compress_folder, random_string
+from ..utils import random_string
 
 load_dotenv()
 
@@ -44,11 +44,9 @@ class SmallWindowMode(Enum):
 class CommandProtocol(Enum):
     OUT_SET_BUTTONS = 0x0001
     OUT_PARTIALLY_UPDATE_BUTTONS = 0x000d
-
     OUT_SET_SMALL_WINDOW_DATA = 0x0006
     OUT_SET_BRIGHTNESS = 0x000a
     OUT_SET_LABEL_STYLE = 0x000b
-
     IN_BUTTON = 0x0101
     IN_DEVICE_INFO = 0x0303
 
@@ -68,7 +66,6 @@ PacketStruct = Struct(
     'data' / Padded(1024 - 8, GreedyBytes),
 )
 
-
 ButtonPressedStruct = Struct(
     'state' / Byte,
     'index' / Byte,
@@ -79,7 +76,7 @@ ButtonPressedStruct = Struct(
 )
 
 IncomingStruct = Struct(
-    Bytes(2),  # b'\x7c\x7c'
+    Bytes(2),
     'command_protocol' / BytesInteger(2),
     'length' / ByteSwapped(Int32ub),
     'data' / Switch(this.command_protocol,
@@ -91,14 +88,11 @@ class UlanziD200Device(DeckDevice):
     USB_VENDOR_ID = 0x2207
     USB_PRODUCT_ID = 0x0019
     INTERFACE_NUMBER = 0
-
     BUTTON_COUNT = 13
     BUTTON_ROWS = 3
     BUTTON_COLS = 5
-
     ICON_WIDTH = 196
     ICON_HEIGHT = 196
-
     DECK_NAME = 'Ulanzi Stream Controller D200'
 
     def __init__(self, hid_device):
@@ -111,80 +105,70 @@ class UlanziD200Device(DeckDevice):
     def set_brightness(self, brightness: int, force=False):
         if not force and brightness == self._brightness:
             return
-
         self._brightness = brightness
         packet = PacketStruct.build(dict(
             command_protocol=CommandProtocol.OUT_SET_BRIGHTNESS.value,
             length=None,
             data=str(brightness).encode('utf-8'),
         ))
-
         self._write_packet(packet)
 
     def set_label_style(self, label_style: Dict, force=False):
         if not force and not DeepDiff(self._label_style, label_style):
             return False
 
-        label_style.setdefault('align', 'bottom')
-        label_style.setdefault('color', 'FFFFFF')
-        label_style.setdefault('font_name', 'Roboto')
-        label_style.setdefault('show_title', True)
-        label_style.setdefault('size', 10)
-        label_style.setdefault('weight', 80)
-        self._label_style = label_style
-
         style = {
-            'Align': label_style['align'],
-            'Color': int(label_style['color'], 16),
-            'FontName': label_style['font_name'],
-            'ShowTitle': bool(label_style['show_title']),
-            'Size': label_style['size'],
-            'Weight': label_style['weight'],
+            'Align': label_style.get('align', 'bottom'),
+            'Color': int(label_style.get('color', 'FFFFFF'), 16),
+            'FontName': label_style.get('font_name', 'Roboto'),
+            'ShowTitle': bool(label_style.get('show_title', True)),
+            'Size': label_style.get('size', 10),
+            'Weight': label_style.get('weight', 80),
         }
-
+        self._label_style = label_style
         packet = PacketStruct.build(dict(
             command_protocol=CommandProtocol.OUT_SET_LABEL_STYLE.value,
             length=None,
             data=bytearray(json.dumps(style).encode('utf-8')),
         ))
-
         self._write_packet(packet)
 
     def set_small_window_data(self, data: Dict, force=False):
         if not force and not DeepDiff(self._small_window_data, data):
             return False
 
-        data.setdefault('time', datetime.now().strftime('%H:%M:%S'))
-        data.setdefault('mode', self._small_window_mode)
-        data.setdefault('cpu', 0)
-        data.setdefault('mem', 0)
-        data.setdefault('gpu', 0)
+        # Use provided mode or fallback to current internal mode
+        mode = data.get('mode', self._small_window_mode)
+        if isinstance(mode, SmallWindowMode):
+            mode_val = mode.value
+        else:
+            mode_val = int(mode)
+
+        cpu = data.get('cpu', 0)
+        mem = data.get('mem', 0)
+        gpu = data.get('gpu', 0)
+        time_str = data.get('time', datetime.now().strftime('%H:%M:%S'))
 
         self._small_window_data = data
 
-        # "1|9|64|16:23:04|0"  cpu: "9"  mem: "64"  time: "16:23:04"  GPU: "0"
-        data = f'{data["mode"].value}|{data["cpu"]}|{data["mem"]}|{data["time"]}|{data["gpu"]}'
+        # Format: "mode|cpu|mem|time|gpu"
+        payload = f'{mode_val}|{cpu}|{mem}|{time_str}|{gpu}'
 
         packet = PacketStruct.build(dict(
             command_protocol=CommandProtocol.OUT_SET_SMALL_WINDOW_DATA.value,
             length=None,
-            data=data.encode('utf-8'),
+            data=payload.encode('utf-8'),
         ))
-
         self._write_packet(packet)
 
     def set_buttons(self, buttons: Dict[int, Dict], *, update_only=False):
-        self._prepare_zip(buttons)
+        """high-performance button update using in-memory ZIP."""
+        zip_data = self._prepare_zip_ram(buttons)
         chunk_size = 1024
-
-        data = b''
-        with open(os.path.join('.build', 'build.zip'), 'rb') as fp:
-            data += fp.read()
-
-        file_size = len(data)
+        file_size = len(zip_data)
 
         command = CommandProtocol.OUT_PARTIALLY_UPDATE_BUTTONS if update_only else CommandProtocol.OUT_SET_BUTTONS
-        chunk = data[:chunk_size - 8]
+        chunk = zip_data[:chunk_size - 8]
         packet = PacketStruct.build(dict(
             command_protocol=command.value,
             length=file_size,
@@ -192,121 +176,93 @@ class UlanziD200Device(DeckDevice):
         ))
 
         packets = [packet]
-
-        for i in range(chunk_size - 8, len(data), chunk_size):
-            chunk = data[i:i + chunk_size]
-            chunk = chunk.ljust(chunk_size, b'\x00')
-            packets.append(chunk)
+        for i in range(chunk_size - 8, len(zip_data), chunk_size):
+            chunk = zip_data[i:i + chunk_size]
+            packets.append(chunk.ljust(chunk_size, b'\x00'))
 
         self._write_packet(packets)
+
+    def _prepare_zip_ram(self, buttons: Dict) -> bytes:
+        """creates a zip file in RAM with anti-bug padding."""
+        invalid_bytes = [b'\x00', b'\x7c']
+
+        # Pre-convert all images to bytes to avoid repeated PIL work in loop
+        processed_icons = {}
+        for idx, btn in buttons.items():
+            if 'icon' in btn and isinstance(btn['icon'], Image.Image):
+                buf = io.BytesIO()
+                btn['icon'].save(buf, format='PNG')
+                processed_icons[idx] = buf.getvalue()
+
+        dummy_retries = 0
+        while dummy_retries < 50:
+            zip_buffer = io.BytesIO()
+            manifest = {}
+
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as zf:
+                for button_index, button in buttons.items():
+                    button_index = int(button_index)
+                    row = button_index // self.BUTTON_COLS
+                    col = button_index % self.BUTTON_COLS
+
+                    button_data = {'State': 0, 'ViewParam': [{}]}
+                    if 'name' in button:
+                        button_data['ViewParam'][0]['Text'] = button['name']
+
+                    if 'icon' in button:
+                        icon_filename = f"icon_{button_index}.png"
+                        if button_index in processed_icons:
+                            zf.writestr(
+                                f"icons/{icon_filename}", processed_icons[button_index])
+                        elif isinstance(button['icon'], str) and os.path.exists(button['icon']):
+                            with open(button['icon'], 'rb') as f:
+                                zf.writestr(f"icons/{icon_filename}", f.read())
+
+                        button_data['ViewParam'][0]['Icon'] = f'icons/{icon_filename}'
+
+                    manifest[f'{col}_{row}'] = button_data
+
+                if dummy_retries > 0:
+                    zf.writestr("dummy.txt", random_string(8 * dummy_retries))
+
+                zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+            zip_data = zip_buffer.getvalue()
+            file_size = len(zip_data)
+
+            # Verify data alignment bug
+            valid = True
+            for i in range(1016, file_size, 1024):
+                if zip_data[i:i+1] in invalid_bytes:
+                    valid = False
+                    break
+
+            if valid:
+                return zip_data
+            dummy_retries += 1
+
+        return zip_data  # Fallback even if invalid
 
     def _parse_input(self, inp):
         try:
             parsed = IncomingStruct.parse(bytes(inp))
-        except Exception:
+            data = parsed['data']
+            if not data:
+                return None
+            if parsed['command_protocol'] == CommandProtocol.IN_BUTTON.value:
+                self._last_action_time = time.time()
+                return ButtonAction(index=data['index'], pressed=data['pressed'], state=data['state'])
+        except:
             return None
-
-        data = parsed['data']
-        if not data:
-            return None
-
-        command_protocol = parsed['command_protocol']
-        if command_protocol == CommandProtocol.IN_DEVICE_INFO.value:
-            pass
-        elif command_protocol == CommandProtocol.IN_BUTTON.value:
-            self._last_action_time = time.time()
-            return ButtonAction(index=data['index'], pressed=data['pressed'], state=data['state'])
 
     def set_small_window_mode(self, mode):
         try:
             self._small_window_mode = SmallWindowMode(mode)
-        except Exception:
+        except:
             self._small_window_mode = SmallWindowMode.CLOCK
 
     def restore_small_window(self):
-        self.set_small_window_data({
-            'mode': self._small_window_mode,
-        })
+        self.set_small_window_data({'mode': self._small_window_mode})
 
-    def _prepare_zip(self, buttons: Dict) -> bool:
-        manifest = {}
-
-        shutil.rmtree('.build', ignore_errors=True)
-        os.makedirs(os.path.join('.build', 'page', 'icons'), exist_ok=True)
-
-        for button_index, button in buttons.items():
-            button_index = int(button_index)
-            row = button_index // self.BUTTON_COLS
-            index = button_index % self.BUTTON_COLS
-
-            button_data = {
-                'State': 0,
-                'ViewParam': [{}],
-            }
-
-            if button:
-                if 'name' in button:
-                    button_data['ViewParam'][0]['Text'] = button['name']
-
-                if 'icon' in button:
-                    # improved icon path handling - checks multiple locations
-                    icon_source = button['icon']
-                    icon_name = os.path.basename(icon_source)
-
-                    found = False
-                    # try direct path, then icons/ folder
-                    search_paths = [icon_source,
-                                    os.path.join('icons', icon_name)]
-                    for p in search_paths:
-                        if os.path.exists(p):
-                            shutil.copyfile(p, os.path.join(
-                                '.build', 'page', 'icons', icon_name))
-                            found = True
-                            break
-
-                    if not found:
-                        # fallback to original cache
-                        cache_path = os.path.join(
-                            '.cache', 'icons', '_generated', icon_source)
-                        if os.path.exists(cache_path):
-                            shutil.copyfile(cache_path, os.path.join(
-                                '.build', 'page', 'icons', icon_name))
-
-                    button_data['ViewParam'][0]['Icon'] = f'icons/{icon_name}'
-
-            manifest[f'{index}_{row}'] = button_data
-
-        page_path = os.path.join('.build', 'page')
-        with open(os.path.join(page_path, 'manifest.json'), 'w') as fp:
-            json.dump(manifest, fp, sort_keys=True,
-                      separators=(',', ':'), indent=2)
-
-        invalid_bytes = [b'\x00', b'\x7c']
-        dummy_str = ''
-        dummy_retries = 0
-        dummy_path = os.path.join(page_path, 'dummy.txt')
-
-        while True:
-            if dummy_retries > 0:
-                with open(dummy_path, 'w') as fp:
-                    dummy_str += random_string(8 * dummy_retries)
-                    fp.write(dummy_str)
-
-            compress_folder(page_path, '.build.zip', 1)
-            file_size = os.path.getsize('.build.zip')
-
-            valid = True
-            with open('.build.zip', 'rb') as fp:
-                for i in range(1016, file_size, 1024):
-                    fp.seek(i)
-                    byte_at = fp.read(1)
-                    if byte_at in invalid_bytes:
-                        valid = False
-                        break
-            if valid:
-                break
-            dummy_retries += 1
-            time.sleep(0.05)
-
-        shutil.move('.build.zip', os.path.join('.build', 'build.zip'))
-        return True
+    def _write_packet(self, packet):
+        super()._write_packet(packet)
