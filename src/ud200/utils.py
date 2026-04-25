@@ -23,5 +23,6 @@ def compress_folder(folder_path, output_zip, compress_level=0):
                     # Don't write dummy file again
                     continue
 
-                arcname = os.path.relpath(file_path, folder_path)  # Preserve folder structure
+                # Preserve folder structure
+                arcname = os.path.relpath(file_path, folder_path)
                 zipf.write(file_path, arcname)

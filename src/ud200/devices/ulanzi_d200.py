@@ -8,7 +8,6 @@ import time
 from datetime import datetime
 from enum import Enum
 from typing import Dict
-from zoneinfo import ZoneInfo
 
 from construct import (
     Adapter,
@@ -18,6 +17,7 @@ from construct import (
     ByteSwapped,
     Const,
     CString,
+    Computed,
     ExprAdapter,
     GreedyBytes,
     Int32ub,
@@ -33,7 +33,6 @@ from ..device import ButtonAction, DeckDevice
 from ..utils import compress_folder, random_string
 
 load_dotenv()
-timezone = ZoneInfo(os.getenv('TIMEZONE', 'America/New_York'))
 
 
 class SmallWindowMode(Enum):
@@ -73,21 +72,25 @@ PacketStruct = Struct(
 ButtonPressedStruct = Struct(
     'state' / Byte,
     'index' / Byte,
-    Const(b'\x01'),
-    'pressed' / ExprAdapter(Byte, lambda obj, ctx: obj == 0x1, lambda obj, ctx: 0x1 if obj else 0x0),
+    'type' / Byte,
+    'pressed_raw' / Byte,
+    'pressed' / Computed(lambda ctx: ctx.type ==
+                         1 if ctx.index == 13 else ctx.pressed_raw == 1),
 )
 
 IncomingStruct = Struct(
     Bytes(2),  # b'\x7c\x7c'
     'command_protocol' / BytesInteger(2),
     'length' / ByteSwapped(Int32ub),
-    'data' / Switch(this.command_protocol, {0x0101: ButtonPressedStruct, 0x0303: CString('ascii')}),
+    'data' / Switch(this.command_protocol,
+                    {0x0101: ButtonPressedStruct, 0x0303: CString('ascii')}),
 )
 
 
 class UlanziD200Device(DeckDevice):
     USB_VENDOR_ID = 0x2207
     USB_PRODUCT_ID = 0x0019
+    INTERFACE_NUMBER = 0
 
     BUTTON_COUNT = 13
     BUTTON_ROWS = 3
@@ -146,13 +149,12 @@ class UlanziD200Device(DeckDevice):
         ))
 
         self._write_packet(packet)
-        print('set_label_style')
 
     def set_small_window_data(self, data: Dict, force=False):
         if not force and not DeepDiff(self._small_window_data, data):
             return False
 
-        data.setdefault('time', datetime.now(timezone).strftime('%H:%M:%S'))
+        data.setdefault('time', datetime.now().strftime('%H:%M:%S'))
         data.setdefault('mode', self._small_window_mode)
         data.setdefault('cpu', 0)
         data.setdefault('mem', 0)
@@ -197,15 +199,12 @@ class UlanziD200Device(DeckDevice):
             chunk = chunk.ljust(chunk_size, b'\x00')
             packets.append(chunk)
 
-        print('send_zip', file_size)
         self._write_packet(packets)
 
     def _parse_input(self, inp):
         try:
             parsed = IncomingStruct.parse(bytes(inp))
-        except Exception as e:
-            print('_parse_input', e)
-            print(binascii.hexlify(bytes(inp)))
+        except Exception:
             return None
 
         data = parsed['data']
@@ -214,10 +213,9 @@ class UlanziD200Device(DeckDevice):
 
         command_protocol = parsed['command_protocol']
         if command_protocol == CommandProtocol.IN_DEVICE_INFO.value:
-            print('_parse_input', data)
+            pass
         elif command_protocol == CommandProtocol.IN_BUTTON.value:
             self._last_action_time = time.time()
-
             return ButtonAction(index=data['index'], pressed=data['pressed'], state=data['state'])
 
     def set_small_window_mode(self, mode):
@@ -254,8 +252,10 @@ class UlanziD200Device(DeckDevice):
                 if 'icon' in button:
                     # Copy icon
                     icon_name = button['icon']
-                    icon_path = os.path.join('.cache', 'icons', '_generated', icon_name)
-                    shutil.copyfile(icon_path, os.path.join('.build', 'page', 'icons', icon_name))
+                    icon_path = os.path.join(
+                        '.cache', 'icons', '_generated', icon_name)
+                    shutil.copyfile(icon_path, os.path.join(
+                        '.build', 'page', 'icons', icon_name))
 
                     button_data['ViewParam'][0]['Icon'] = f'icons/{icon_name}'
 
@@ -263,7 +263,8 @@ class UlanziD200Device(DeckDevice):
 
         page_path = os.path.join('.build', 'page')
         with open(os.path.join(page_path, 'manifest.json'), 'w') as fp:
-            json.dump(manifest, fp, sort_keys=True, separators=(',', ':'), indent=2)
+            json.dump(manifest, fp, sort_keys=True,
+                      separators=(',', ':'), indent=2)
 
         # Chunks start with these bytes cause problems
         invalid_bytes = [
@@ -280,7 +281,6 @@ class UlanziD200Device(DeckDevice):
             # Write a dummy file with random string to modify the zip
             if dummy_retries > 0:
                 with open(dummy_path, 'w') as fp:
-                    print('Generating dummy string...')
                     dummy_str += random_string(8 * dummy_retries)
                     fp.write(dummy_str)
 
