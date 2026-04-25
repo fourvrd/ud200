@@ -250,12 +250,20 @@ class UlanziD200Device(DeckDevice):
                     button_data['ViewParam'][0]['Text'] = button['name']
 
                 if 'icon' in button:
-                    # Copy icon
-                    icon_name = button['icon']
-                    icon_path = os.path.join(
-                        '.cache', 'icons', '_generated', icon_name)
-                    shutil.copyfile(icon_path, os.path.join(
-                        '.build', 'page', 'icons', icon_name))
+                    # Copy icon - support both filename (for cache) and full path
+                    icon_source = button['icon']
+                    icon_name = os.path.basename(icon_source)
+
+                    if os.path.exists(icon_source):
+                        shutil.copyfile(icon_source, os.path.join(
+                            '.build', 'page', 'icons', icon_name))
+                    else:
+                        # Fallback to cache for backward compatibility
+                        cache_path = os.path.join(
+                            '.cache', 'icons', '_generated', icon_source)
+                        if os.path.exists(cache_path):
+                            shutil.copyfile(cache_path, os.path.join(
+                                '.build', 'page', 'icons', icon_name))
 
                     button_data['ViewParam'][0]['Icon'] = f'icons/{icon_name}'
 
