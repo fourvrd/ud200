@@ -164,6 +164,15 @@ class UlanziD200Device(DeckDevice):
     def set_buttons(self, buttons: Dict[int, Dict], *, update_only=False):
         """high-performance button update using in-memory ZIP."""
         zip_data = self._prepare_zip_ram(buttons)
+        
+        # DEBUG: save zip to cache for preview
+        try:
+            os.makedirs(".cache", exist_ok=True)
+            with open(".cache/debug.zip", "wb") as f:
+                f.write(zip_data)
+        except Exception as e:
+            print(f"DEBUG ERROR: failed to save debug zip: {e}")
+
         chunk_size = 1024
         file_size = len(zip_data)
 
