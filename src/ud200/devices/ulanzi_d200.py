@@ -237,6 +237,10 @@ class UlanziD200Device(DeckDevice):
                     manifest[f'{col}_{row}'] = button_data
 
                 manifest["nonce"] = nonce
+                
+                # Add label style for debugger to manifest
+                if hasattr(self, '_label_style') and self._label_style:
+                    manifest["label_style"] = self._label_style
 
                 if dummy_retries > 0:
                     zf.writestr("dummy.txt", random_string(8 * dummy_retries))
