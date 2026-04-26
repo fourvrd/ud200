@@ -192,8 +192,9 @@ class UlanziD200Device(DeckDevice):
         self._write_packet(packets)
 
     def _prepare_zip_ram(self, buttons: Dict) -> bytes:
-        """creates a zip file in RAM with anti-bug padding."""
+        """creates a zip file in RAM with all 15 buttons and cache-busting names."""
         invalid_bytes = [b'\x00', b'\x7c']
+        nonce = int(time.time() * 1000)
 
         # Pre-convert all images to bytes to avoid repeated PIL work in loop
         processed_icons = {}
@@ -209,27 +210,33 @@ class UlanziD200Device(DeckDevice):
             manifest = {}
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as zf:
-                for button_index, button in buttons.items():
-                    button_index = int(button_index)
+                # Always include all 15 buttons in manifest to prevent "ghost" buttons
+                for button_index in range(15):
                     row = button_index // self.BUTTON_COLS
                     col = button_index % self.BUTTON_COLS
-
+                    
+                    button = buttons.get(button_index, {})
                     button_data = {'State': 0, 'ViewParam': [{}]}
-                    if 'name' in button:
-                        button_data['ViewParam'][0]['Text'] = button['name']
+                    
+                    # Text
+                    button_data['ViewParam'][0]['Text'] = button.get('name', "")
 
+                    # Icon
                     if 'icon' in button:
-                        icon_filename = f"icon_{button_index}.png"
+                        # use nonce in filename to force device refresh
+                        icon_filename = f"b_{button_index}_{nonce}.png"
                         if button_index in processed_icons:
-                            zf.writestr(
-                                f"icons/{icon_filename}", processed_icons[button_index])
+                            zf.writestr(f"icons/{icon_filename}", processed_icons[button_index])
                         elif isinstance(button['icon'], str) and os.path.exists(button['icon']):
                             with open(button['icon'], 'rb') as f:
                                 zf.writestr(f"icons/{icon_filename}", f.read())
-
                         button_data['ViewParam'][0]['Icon'] = f'icons/{icon_filename}'
+                    else:
+                        button_data['ViewParam'][0]['Icon'] = ""
 
                     manifest[f'{col}_{row}'] = button_data
+
+                manifest["nonce"] = nonce
 
                 if dummy_retries > 0:
                     zf.writestr("dummy.txt", random_string(8 * dummy_retries))
